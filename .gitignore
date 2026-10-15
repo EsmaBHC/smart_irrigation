@@ -1,0 +1,7 @@
+.env
+**/secrets.h
+mosquitto/config/passwd
+mosquitto/data/
+influxdb/data/
+nodered/data/
+influxdb/

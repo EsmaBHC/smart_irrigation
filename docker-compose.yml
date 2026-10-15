@@ -1,0 +1,38 @@
+services:
+  mosquitto:
+    image: eclipse-mosquitto:2
+    container_name: mosquitto
+    ports:
+      - "1883:1883"
+    volumes:
+      - ./mosquitto/config:/mosquitto/config
+      - ./mosquitto/data:/mosquitto/data
+    restart: unless-stopped
+
+  nodered:
+    image: nodered/node-red:latest
+    container_name: nodered
+    restart: unless-stopped
+    ports:
+      - "1880:1880"
+    environment:
+      - TZ=Africa/Algiers
+      - NODE_RED_CREDENTIAL_SECRET=${NODERED_SECRET}
+    volumes:
+      - ./nodered/data:/data
+    depends_on:
+      - mosquitto
+      - influxdb
+
+  influxdb:
+    image: influxdb:1.8
+    container_name: influxdb
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:8086:8086"
+    environment:
+      - INFLUXDB_DB=${INFLUX_DB}
+      - INFLUXDB_HTTP_AUTH_ENABLED=false
+      - TZ=Africa/Algiers
+    volumes:
+      - ./influxdb/data:/var/lib/influxdb

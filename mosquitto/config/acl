@@ -1,0 +1,11 @@
+user esp32
+topic write agriculture/esma/sensors/#
+topic write agriculture/esma/status
+topic write agriculture/esma/alerts
+topic write agriculture/esma/info
+topic write agriculture/esma/actuators/+
+topic read  agriculture/esma/actuators/+/cmd
+
+user nodered
+topic read  agriculture/esma/#
+topic write agriculture/esma/actuators/+/cmd

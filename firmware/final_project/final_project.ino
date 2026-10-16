@@ -1,35 +1,41 @@
+/*
+  Smart Agriculture IoT - ESP32
+  Sensors : AHT20 (temp + humidity), BMP280 (pressure), capacitive soil sensor
+  Outputs : irrigation pump (automatic), 2 LEDs (manual via MQTT)
+  Network : WiFi + MQTT (authenticated) + small local web page
+
+  Requires a "secrets.h" file next to this sketch (see secrets.example.h):
+    WIFI_SSID, WIFI_PASSWORD, MQTT_BROKER, MQTT_PORT, MQTT_USER, MQTT_PASS
+*/
+
 #include <WiFi.h>
 #include <WebServer.h>
 #include <Wire.h>
-#include <secrets.example.h>
+
 #include <Adafruit_AHTX0.h>
 #include <Adafruit_BMP280.h>
 #include <PubSubClient.h>
 
-// ================= WIFI =================
-
-
-// ================= MQTT =================
-
-// IP du PC Mosquitto (SANS espace)
-
+#include "secrets.h"
 
 // ================= TOPICS =================
 
 const char* TOPIC_TEMP         = "agriculture/esma/sensors/temp";
 const char* TOPIC_HUMIDITY     = "agriculture/esma/sensors/humidity";
 const char* TOPIC_SOIL         = "agriculture/esma/sensors/soil";
+const char* TOPIC_PRESSURE     = "agriculture/esma/sensors/pressure";
 
 const char* TOPIC_STATUS       = "agriculture/esma/status";
 const char* TOPIC_ALERT        = "agriculture/esma/alerts";
 const char* TOPIC_INFO         = "agriculture/esma/info";
+const char* TOPIC_AVAILABILITY = "agriculture/esma/availability";   // online / offline (Last Will)
 
-// Etats publies par l'ESP32
+// States published by the ESP32
 const char* TOPIC_IRRIGATION   = "agriculture/esma/actuators/irrigation";
 const char* TOPIC_TEMP_LED     = "agriculture/esma/actuators/temperature_led";
 const char* TOPIC_HUMIDITY_LED = "agriculture/esma/actuators/humidity_led";
 
-// Commandes recues par l'ESP32 (ON / OFF)
+// Commands received by the ESP32 (ON / OFF)
 const char* TOPIC_TEMP_LED_CMD     = "agriculture/esma/actuators/temperature_led/cmd";
 const char* TOPIC_HUMIDITY_LED_CMD = "agriculture/esma/actuators/humidity_led/cmd";
 
@@ -40,14 +46,14 @@ const char* TOPIC_HUMIDITY_LED_CMD = "agriculture/esma/actuators/humidity_led/cm
 
 #define SOIL_PIN 7
 
-#define IRRIGATION_PIN 4
-#define TEMP_LED_PIN 5
+#define IRRIGATION_PIN   4
+#define TEMP_LED_PIN     5
 #define HUMIDITY_LED_PIN 6
 
 // ================= SOIL CALIBRATION =================
 
-#define SOIL_AIR 2215
-#define SOIL_WATER 270
+#define SOIL_AIR   2215    // raw value in dry air  (0 %)
+#define SOIL_WATER 270     // raw value in water    (100 %)
 
 // ================= THRESHOLDS =================
 
@@ -56,8 +62,21 @@ const char* TOPIC_HUMIDITY_LED_CMD = "agriculture/esma/actuators/humidity_led/cm
 
 #define TEMP_HIGH_LIMIT 30.0
 
-#define HUMIDITY_LOW_LIMIT 35.0
+#define HUMIDITY_LOW_LIMIT  35.0
 #define HUMIDITY_HIGH_LIMIT 80.0
+
+// ================= PUMP SAFETY =================
+
+const unsigned long PUMP_MAX_RUN_MS   = 5UL * 60UL * 1000UL;   // stop after 5 min of continuous run
+const unsigned long PUMP_COOLDOWN_MS  = 2UL * 60UL * 1000UL;   // then wait 2 min before restarting
+
+// ================= ALERT BITS =================
+
+#define ALERT_SOIL_DRY      (1 << 0)
+#define ALERT_TEMP_HIGH     (1 << 1)
+#define ALERT_HUMIDITY      (1 << 2)
+#define ALERT_SENSOR_FAULT  (1 << 3)
+#define ALERT_PUMP_TIMEOUT  (1 << 4)
 
 // ================= OBJECTS =================
 
@@ -71,92 +90,201 @@ PubSubClient mqttClient(wifiClient);
 
 // ================= VALUES =================
 
-float temperature = 0.0;
-float humidity = 0.0;
-int soilPercent = 0;
+float temperature = NAN;
+float humidity    = NAN;
+float pressure    = NAN;     // hPa
+int   soilPercent = 0;
+
+bool ahtOk  = false;
+bool bmpOk  = false;
+bool soilOk = false;
 
 // ================= STATES =================
 
-bool irrigationActive = false;   // automatique
+bool irrigationActive = false;   // automatic
+bool temperatureLedOn = false;   // manual (Node-RED)
+bool humidityLedOn    = false;   // manual (Node-RED)
 
-bool temperatureLedOn = false;   // manuel (Node-RED)
-bool humidityLedOn = false;      // manuel (Node-RED)
+unsigned long pumpStartedAt = 0;
+unsigned long pumpLockUntil = 0;
+
+uint8_t lastAlertMask = 0;
 
 String systemStatus = "STARTING";
 
 // ================= TIMERS =================
 
-unsigned long lastSensorRead = 0;
-unsigned long lastMQTTPublish = 0;
+unsigned long lastSensorRead    = 0;
+unsigned long lastMQTTPublish   = 0;
 unsigned long lastMQTTReconnect = 0;
+unsigned long lastWiFiAttempt   = 0;
 
-const unsigned long SENSOR_INTERVAL = 2000;
-const unsigned long MQTT_INTERVAL = 5000;
+const unsigned long SENSOR_INTERVAL         = 2000;
+const unsigned long MQTT_INTERVAL           = 5000;
 const unsigned long MQTT_RECONNECT_INTERVAL = 5000;
+const unsigned long WIFI_RETRY_INTERVAL     = 10000;
+
+// ================= HELPERS =================
+
+void publishMsg(const char* topic, const char* payload, bool retained = false) {
+  if (mqttClient.connected()) {
+    mqttClient.publish(topic, payload, retained);
+  }
+}
+
+String numOrNull(float v, int decimals) {
+  return isnan(v) ? String("null") : String(v, decimals);
+}
 
 // ================= READ SENSORS =================
 
-void readSensors() {
-
-  sensors_event_t humidityEvent;
-  sensors_event_t temperatureEvent;
-
-  aht.getEvent(&humidityEvent, &temperatureEvent);
-
-  temperature = temperatureEvent.temperature;
-  humidity = humidityEvent.relative_humidity;
-
-  int soilRaw = analogRead(SOIL_PIN);
-
-  soilPercent = map(soilRaw, SOIL_AIR, SOIL_WATER, 0, 100);
-  soilPercent = constrain(soilPercent, 0, 100);
+int readSoilRaw() {
+  // Average 16 samples to reduce ADC noise
+  long sum = 0;
+  for (int i = 0; i < 16; i++) {
+    sum += analogRead(SOIL_PIN);
+    delay(2);
+  }
+  return (int)(sum / 16);
 }
 
-// ================= IRRIGATION (AUTOMATIQUE) =================
+void readSensors() {
+
+  // --- AHT20 ---
+  if (ahtOk) {
+    sensors_event_t humidityEvent;
+    sensors_event_t temperatureEvent;
+    aht.getEvent(&humidityEvent, &temperatureEvent);
+
+    float t = temperatureEvent.temperature;
+    float h = humidityEvent.relative_humidity;
+
+    if (isnan(t) || isnan(h) || h < 0 || h > 100) {
+      temperature = NAN;
+      humidity = NAN;
+    } else {
+      temperature = t;
+      humidity = h;
+    }
+  } else {
+    temperature = NAN;
+    humidity = NAN;
+  }
+
+  // --- BMP280 ---
+  if (bmpOk) {
+    float p = bmp.readPressure() / 100.0;   // Pa -> hPa
+    pressure = (isnan(p) || p < 300 || p > 1100) ? NAN : p;
+  }
+
+  // --- Soil ---
+  int soilRaw = readSoilRaw();
+
+  // A raw value of 0 or full scale means the sensor is unplugged or shorted
+  soilOk = (soilRaw > 50 && soilRaw < 4090);
+
+  if (soilOk) {
+    soilPercent = map(soilRaw, SOIL_AIR, SOIL_WATER, 0, 100);
+    soilPercent = constrain(soilPercent, 0, 100);
+  }
+}
+
+// ================= IRRIGATION (AUTOMATIC, WITH SAFETY) =================
 
 void controlIrrigation() {
 
-  // Hysteresis :
-  // Sol < 50%  -> pompe ON
-  // Sol > 80%  -> pompe OFF
-  // Entre les deux -> etat precedent
+  unsigned long now = millis();
 
-  if (soilPercent < SOIL_DRY_LIMIT) {
-    irrigationActive = true;
-  }
-  else if (soilPercent > SOIL_WET_LIMIT) {
+  if (!soilOk) {
+    // Never irrigate on invalid data
     irrigationActive = false;
+  }
+  else if (irrigationActive) {
+
+    if (soilPercent > SOIL_WET_LIMIT) {
+      irrigationActive = false;                         // soil wet enough
+    }
+    else if (now - pumpStartedAt >= PUMP_MAX_RUN_MS) {
+      irrigationActive = false;                         // safety timeout
+      pumpLockUntil = now + PUMP_COOLDOWN_MS;
+      Serial.println("PUMP SAFETY: max run time reached, cooldown started");
+    }
+  }
+  else {
+
+    bool lockedOut = ((long)(pumpLockUntil - now) > 0);
+
+    if (soilPercent < SOIL_DRY_LIMIT && !lockedOut) {
+      irrigationActive = true;
+      pumpStartedAt = now;
+    }
   }
 
   digitalWrite(IRRIGATION_PIN, irrigationActive ? HIGH : LOW);
 }
 
-// ================= SYSTEM STATUS (selon les mesures) =================
+// ================= ALERTS =================
+
+uint8_t computeAlertMask() {
+
+  uint8_t mask = 0;
+
+  if (!soilOk || !ahtOk || isnan(temperature) || isnan(humidity)) {
+    mask |= ALERT_SENSOR_FAULT;
+  }
+  if (soilOk && soilPercent < SOIL_DRY_LIMIT) {
+    mask |= ALERT_SOIL_DRY;
+  }
+  if (!isnan(temperature) && temperature > TEMP_HIGH_LIMIT) {
+    mask |= ALERT_TEMP_HIGH;
+  }
+  if (!isnan(humidity) && (humidity < HUMIDITY_LOW_LIMIT || humidity > HUMIDITY_HIGH_LIMIT)) {
+    mask |= ALERT_HUMIDITY;
+  }
+  if (!irrigationActive && (long)(pumpLockUntil - millis()) > 0) {
+    mask |= ALERT_PUMP_TIMEOUT;
+  }
+
+  return mask;
+}
+
+// Publish an alert only when it newly appears (no spam)
+void publishAlerts() {
+
+  if (!mqttClient.connected()) {
+    return;
+  }
+
+  uint8_t mask = computeAlertMask();
+  uint8_t newAlerts = mask & ~lastAlertMask;
+
+  if (newAlerts & ALERT_SENSOR_FAULT) publishMsg(TOPIC_ALERT, "SENSOR_FAULT");
+  if (newAlerts & ALERT_SOIL_DRY)     publishMsg(TOPIC_ALERT, "SOIL_DRY");
+  if (newAlerts & ALERT_TEMP_HIGH)    publishMsg(TOPIC_ALERT, "TEMPERATURE_HIGH");
+  if (newAlerts & ALERT_HUMIDITY)     publishMsg(TOPIC_ALERT, "HUMIDITY_ABNORMAL");
+  if (newAlerts & ALERT_PUMP_TIMEOUT) publishMsg(TOPIC_ALERT, "PUMP_TIMEOUT");
+
+  lastAlertMask = mask;
+}
+
+// ================= SYSTEM STATUS =================
 
 void updateSystemStatus() {
 
-  if (soilPercent < SOIL_DRY_LIMIT) {
-    systemStatus = "SOIL_DRY";
-  }
-  else if (temperature > TEMP_HIGH_LIMIT) {
-    systemStatus = "TOO_HOT";
-  }
-  else if (humidity < HUMIDITY_LOW_LIMIT) {
-    systemStatus = "LOW_HUMIDITY";
-  }
-  else if (humidity > HUMIDITY_HIGH_LIMIT) {
-    systemStatus = "HIGH_HUMIDITY";
-  }
-  else {
-    systemStatus = "NORMAL";
-  }
+  uint8_t mask = computeAlertMask();
+
+  if (mask & ALERT_SENSOR_FAULT)         systemStatus = "SENSOR_FAULT";
+  else if (mask & ALERT_SOIL_DRY)        systemStatus = "SOIL_DRY";
+  else if (mask & ALERT_TEMP_HIGH)       systemStatus = "TOO_HOT";
+  else if (!isnan(humidity) && humidity < HUMIDITY_LOW_LIMIT)  systemStatus = "LOW_HUMIDITY";
+  else if (!isnan(humidity) && humidity > HUMIDITY_HIGH_LIMIT) systemStatus = "HIGH_HUMIDITY";
+  else                                   systemStatus = "NORMAL";
 }
 
 // ================= AUTOMATION =================
 
 void updateAutomation() {
-
-  controlIrrigation();     // seule la pompe est automatique
+  controlIrrigation();     // only the pump is automatic
   updateSystemStatus();
 }
 
@@ -187,33 +315,73 @@ void mqttCallback(char* topic, byte* payload, unsigned int length) {
     newState = false;
   }
   else {
-    return;   // message inconnu, on ignore
+    return;   // unknown message, ignore
   }
 
-  // ----- LED TEMPERATURE -----
-  if (String(topic) == TOPIC_TEMP_LED_CMD) {
+  if (strcmp(topic, TOPIC_TEMP_LED_CMD) == 0) {
 
     temperatureLedOn = newState;
     digitalWrite(TEMP_LED_PIN, temperatureLedOn ? HIGH : LOW);
-
-    mqttClient.publish(TOPIC_TEMP_LED, temperatureLedOn ? "ON" : "OFF");
+    publishMsg(TOPIC_TEMP_LED, temperatureLedOn ? "ON" : "OFF");
   }
-
-  // ----- LED HUMIDITE -----
-  else if (String(topic) == TOPIC_HUMIDITY_LED_CMD) {
+  else if (strcmp(topic, TOPIC_HUMIDITY_LED_CMD) == 0) {
 
     humidityLedOn = newState;
     digitalWrite(HUMIDITY_LED_PIN, humidityLedOn ? HIGH : LOW);
-
-    mqttClient.publish(TOPIC_HUMIDITY_LED, humidityLedOn ? "ON" : "OFF");
+    publishMsg(TOPIC_HUMIDITY_LED, humidityLedOn ? "ON" : "OFF");
   }
+}
+
+// ================= WIFI =================
+
+void connectWiFi(unsigned long timeoutMs) {
+
+  WiFi.mode(WIFI_STA);
+  WiFi.setAutoReconnect(true);
+  WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
+
+  unsigned long start = millis();
+
+  while (WiFi.status() != WL_CONNECTED && millis() - start < timeoutMs) {
+    delay(500);
+    Serial.print(".");
+  }
+
+  Serial.println();
+
+  if (WiFi.status() == WL_CONNECTED) {
+    Serial.println("WiFi CONNECTED!");
+    Serial.print("ESP32 IP: ");
+    Serial.println(WiFi.localIP());
+  } else {
+    Serial.println("WiFi not connected yet, will keep retrying in background.");
+  }
+}
+
+void maintainWiFi() {
+
+  if (WiFi.status() == WL_CONNECTED) {
+    return;
+  }
+
+  unsigned long now = millis();
+
+  if (now - lastWiFiAttempt < WIFI_RETRY_INTERVAL) {
+    return;
+  }
+
+  lastWiFiAttempt = now;
+
+  Serial.println("WiFi lost, reconnecting...");
+  WiFi.disconnect();
+  WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
 }
 
 // ================= MQTT CONNECTION =================
 
 void reconnectMQTT() {
 
-  if (mqttClient.connected()) {
+  if (mqttClient.connected() || WiFi.status() != WL_CONNECTED) {
     return;
   }
 
@@ -230,17 +398,29 @@ void reconnectMQTT() {
   String clientId = "agriculture-esma-";
   clientId += WiFi.macAddress();
 
- if (mqttClient.connect(clientId.c_str(), MQTT_USER, MQTT_PASS)) { {
+  // Last Will: if the ESP32 disappears, the broker publishes "offline" (retained)
+  bool ok = mqttClient.connect(clientId.c_str(),
+                               MQTT_USER, MQTT_PASS,
+                               TOPIC_AVAILABILITY, 1, true, "offline");
+
+  if (ok) {
 
     Serial.println("CONNECTED!");
 
     mqttClient.subscribe(TOPIC_TEMP_LED_CMD);
     mqttClient.subscribe(TOPIC_HUMIDITY_LED_CMD);
 
-    mqttClient.publish(TOPIC_INFO, "ESP32 Agriculture System connected");
+    publishMsg(TOPIC_AVAILABILITY, "online", true);
+    publishMsg(TOPIC_INFO, "ESP32 Agriculture System connected");
+
+    publishMsg(TOPIC_TEMP_LED, temperatureLedOn ? "ON" : "OFF");
+    publishMsg(TOPIC_HUMIDITY_LED, humidityLedOn ? "ON" : "OFF");
+
+    lastAlertMask = 0;   // re-announce active alerts after a reconnect
   }
   else {
 
+    // 4 = bad credentials, 5 = not authorised
     Serial.print("FAILED, state = ");
     Serial.println(mqttClient.state());
   }
@@ -254,47 +434,38 @@ void publishSensorData() {
     return;
   }
 
-  char tempBuffer[10];
-  char humidityBuffer[10];
-  char soilBuffer[10];
+  char buffer[16];
 
-  snprintf(tempBuffer, sizeof(tempBuffer), "%.2f", temperature);
-  snprintf(humidityBuffer, sizeof(humidityBuffer), "%.2f", humidity);
-  snprintf(soilBuffer, sizeof(soilBuffer), "%d", soilPercent);
-
-  // Capteurs
-  mqttClient.publish(TOPIC_TEMP, tempBuffer);
-  mqttClient.publish(TOPIC_HUMIDITY, humidityBuffer);
-  mqttClient.publish(TOPIC_SOIL, soilBuffer);
-
-  // Statut
-  mqttClient.publish(TOPIC_STATUS, systemStatus.c_str());
-
-  // Pompe (etat affiche dans Node-RED)
-  mqttClient.publish(TOPIC_IRRIGATION, irrigationActive ? "ON" : "OFF");
-
-  // LEDs (etat reel)
-  mqttClient.publish(TOPIC_TEMP_LED, temperatureLedOn ? "ON" : "OFF");
-  mqttClient.publish(TOPIC_HUMIDITY_LED, humidityLedOn ? "ON" : "OFF");
-
-  // Alertes (selon les mesures)
-  if (soilPercent < SOIL_DRY_LIMIT) {
-    mqttClient.publish(TOPIC_ALERT, "SOIL_DRY");
+  if (!isnan(temperature)) {
+    snprintf(buffer, sizeof(buffer), "%.2f", temperature);
+    publishMsg(TOPIC_TEMP, buffer);
   }
-  else if (temperature > TEMP_HIGH_LIMIT) {
-    mqttClient.publish(TOPIC_ALERT, "TEMPERATURE_HIGH");
+
+  if (!isnan(humidity)) {
+    snprintf(buffer, sizeof(buffer), "%.2f", humidity);
+    publishMsg(TOPIC_HUMIDITY, buffer);
   }
-  else if (humidity < HUMIDITY_LOW_LIMIT || humidity > HUMIDITY_HIGH_LIMIT) {
-    mqttClient.publish(TOPIC_ALERT, "HUMIDITY_ABNORMAL");
+
+  if (!isnan(pressure)) {
+    snprintf(buffer, sizeof(buffer), "%.1f", pressure);
+    publishMsg(TOPIC_PRESSURE, buffer);
   }
+
+  if (soilOk) {
+    snprintf(buffer, sizeof(buffer), "%d", soilPercent);
+    publishMsg(TOPIC_SOIL, buffer);
+  }
+
+  publishMsg(TOPIC_STATUS, systemStatus.c_str());
+
+  publishMsg(TOPIC_IRRIGATION, irrigationActive ? "ON" : "OFF");
+  publishMsg(TOPIC_TEMP_LED, temperatureLedOn ? "ON" : "OFF");
+  publishMsg(TOPIC_HUMIDITY_LED, humidityLedOn ? "ON" : "OFF");
 }
 
 // ================= WEB DASHBOARD =================
 
-void handleRoot() {
-
-  String html = R"rawliteral(
-
+const char INDEX_HTML[] PROGMEM = R"rawliteral(
 <!DOCTYPE html>
 <html>
 <head>
@@ -312,72 +483,59 @@ h1 { color: #245c32; }
 </head>
 <body>
 <div class="container">
-
-<h1>🌱 Smart Agriculture IoT</h1>
-
-<div class="card"><h2>🌡 Temperature</h2>
-<div class="value"><span id="temperature">--</span> °C</div></div>
-
-<div class="card"><h2>💧 Air Humidity</h2>
-<div class="value"><span id="humidity">--</span> %</div></div>
-
-<div class="card"><h2>🌱 Soil Moisture</h2>
-<div class="value"><span id="soil">--</span> %</div></div>
-
-<div class="card"><h2>System Status</h2>
-<div class="status"><span id="status">--</span></div></div>
-
-<div class="card"><h2>🚿 Irrigation</h2>
-<div class="status"><span id="irrigation">--</span></div></div>
-
-<div class="card"><h2>Temperature LED</h2>
-<div class="status"><span id="tempLed">--</span></div></div>
-
-<div class="card"><h2>Humidity LED</h2>
-<div class="status"><span id="humidityLed">--</span></div></div>
-
+<h1>Smart Agriculture IoT</h1>
+<div class="card"><h2>Temperature</h2><div class="value"><span id="temperature">--</span> &deg;C</div></div>
+<div class="card"><h2>Air Humidity</h2><div class="value"><span id="humidity">--</span> %</div></div>
+<div class="card"><h2>Pressure</h2><div class="value"><span id="pressure">--</span> hPa</div></div>
+<div class="card"><h2>Soil Moisture</h2><div class="value"><span id="soil">--</span> %</div></div>
+<div class="card"><h2>System Status</h2><div class="status"><span id="status">--</span></div></div>
+<div class="card"><h2>Irrigation</h2><div class="status"><span id="irrigation">--</span></div></div>
+<div class="card"><h2>Temperature LED</h2><div class="status"><span id="tempLed">--</span></div></div>
+<div class="card"><h2>Humidity LED</h2><div class="status"><span id="humidityLed">--</span></div></div>
+<div class="card"><h2>MQTT</h2><div class="status"><span id="mqtt">--</span></div></div>
 </div>
-
 <script>
+function fmt(v, d) { return (v === null || v === undefined) ? "--" : v.toFixed(d); }
 function updateData() {
   fetch('/data')
-    .then(response => response.json())
+    .then(r => r.json())
     .then(data => {
-      document.getElementById("temperature").innerText = data.temperature.toFixed(1);
-      document.getElementById("humidity").innerText = data.humidity.toFixed(1);
-      document.getElementById("soil").innerText = data.soil;
+      document.getElementById("temperature").innerText = fmt(data.temperature, 1);
+      document.getElementById("humidity").innerText = fmt(data.humidity, 1);
+      document.getElementById("pressure").innerText = fmt(data.pressure, 1);
+      document.getElementById("soil").innerText = data.soil === null ? "--" : data.soil;
       document.getElementById("status").innerText = data.status;
       document.getElementById("irrigation").innerText = data.irrigation ? "ON" : "OFF";
       document.getElementById("tempLed").innerText = data.temperatureLed ? "ON" : "OFF";
       document.getElementById("humidityLed").innerText = data.humidityLed ? "ON" : "OFF";
+      document.getElementById("mqtt").innerText = data.mqtt ? "CONNECTED" : "DISCONNECTED";
     })
-    .catch(error => { console.log("Error:", error); });
+    .catch(e => console.log("Error:", e));
 }
 setInterval(updateData, 2000);
 updateData();
 </script>
-
 </body>
 </html>
-
 )rawliteral";
 
-  server.send(200, "text/html", html);
+void handleRoot() {
+  server.send_P(200, "text/html", INDEX_HTML);
 }
-
-// ================= JSON =================
 
 void handleData() {
 
   String json = "{";
 
-  json += "\"temperature\":" + String(temperature, 1);
-  json += ",\"humidity\":" + String(humidity, 1);
-  json += ",\"soil\":" + String(soilPercent);
+  json += "\"temperature\":" + numOrNull(temperature, 1);
+  json += ",\"humidity\":" + numOrNull(humidity, 1);
+  json += ",\"pressure\":" + numOrNull(pressure, 1);
+  json += ",\"soil\":" + (soilOk ? String(soilPercent) : String("null"));
   json += ",\"status\":\"" + systemStatus + "\"";
   json += ",\"irrigation\":" + String(irrigationActive ? "true" : "false");
   json += ",\"temperatureLed\":" + String(temperatureLedOn ? "true" : "false");
   json += ",\"humidityLed\":" + String(humidityLedOn ? "true" : "false");
+  json += ",\"mqtt\":" + String(mqttClient.connected() ? "true" : "false");
 
   json += "}";
 
@@ -408,34 +566,18 @@ void setup() {
   Wire.begin(SDA_PIN, SCL_PIN);
 
   Serial.println("Initializing AHT20...");
-  if (!aht.begin()) {
-    Serial.println("ERROR: AHT20 not found!");
-  } else {
-    Serial.println("AHT20 OK!");
-  }
+  ahtOk = aht.begin();
+  Serial.println(ahtOk ? "AHT20 OK!" : "ERROR: AHT20 not found!");
 
   Serial.println("Initializing BMP280...");
-  if (!bmp.begin(0x77)) {
-    Serial.println("BMP280 not found");
-  } else {
-    Serial.println("BMP280 OK!");
-  }
+  bmpOk = bmp.begin(0x77) || bmp.begin(0x76);
+  Serial.println(bmpOk ? "BMP280 OK!" : "BMP280 not found (pressure disabled)");
 
   Serial.println();
   Serial.print("Connecting to WiFi: ");
   Serial.println(WIFI_SSID);
 
-  WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
-
-  while (WiFi.status() != WL_CONNECTED) {
-    delay(500);
-    Serial.print(".");
-  }
-
-  Serial.println();
-  Serial.println("WiFi CONNECTED!");
-  Serial.print("ESP32 IP: ");
-  Serial.println(WiFi.localIP());
+  connectWiFi(20000);   // 20 s max, never blocks forever
 
   mqttClient.setServer(MQTT_BROKER, MQTT_PORT);
   mqttClient.setCallback(mqttCallback);
@@ -446,7 +588,8 @@ void setup() {
 
   Serial.println("Web server started!");
 
-  reconnectMQTT();
+  readSensors();
+  updateAutomation();
 
   Serial.println();
   Serial.println("SYSTEM READY!");
@@ -457,8 +600,9 @@ void setup() {
 void loop() {
 
   server.handleClient();
-  mqttClient.loop();
+  maintainWiFi();
   reconnectMQTT();
+  mqttClient.loop();
 
   unsigned long now = millis();
 
@@ -466,6 +610,7 @@ void loop() {
     lastSensorRead = now;
     readSensors();
     updateAutomation();
+    publishAlerts();
   }
 
   if (now - lastMQTTPublish >= MQTT_INTERVAL) {

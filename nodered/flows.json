@@ -1,0 +1,123 @@
+[
+    {
+        "id": "d8740305302d55fa",
+        "type": "ui-template",
+        "z": "292468cc1d5f431a",
+        "group": "316b9087067c7552",
+        "page": "",
+        "ui": "",
+        "name": "",
+        "order": 1,
+        "width": 0,
+        "height": 0,
+        "head": "",
+        "format": "<template>\n  <div class=\"al-root\">\n\n    <!-- Live strip -->\n    <div class=\"al-live\">\n      <span class=\"al-live-dot\"></span>\n      <span>Monitoring live</span>\n      <span class=\"al-live-last\" v-if=\"latest\">Last alert: {{ latest.time }}</span>\n    </div>\n\n    <!-- Summary tiles -->\n    <div class=\"al-stats\">\n      <div class=\"al-stat al-leaf\">\n        <v-icon class=\"al-stat-bg\" size=\"64\" icon=\"mdi-sprout\"></v-icon>\n        <span class=\"al-stat-label\">Total</span>\n        <span class=\"al-stat-num\">{{ total }}</span>\n      </div>\n      <div class=\"al-stat al-high\">\n        <v-icon class=\"al-stat-bg\" size=\"64\" icon=\"mdi-white-balance-sunny\"></v-icon>\n        <span class=\"al-stat-label\"><v-icon size=\"14\" icon=\"mdi-arrow-up\"></v-icon> Too high</span>\n        <span class=\"al-stat-num\">{{ highCount }}</span>\n      </div>\n      <div class=\"al-stat al-low\">\n        <v-icon class=\"al-stat-bg\" size=\"64\" icon=\"mdi-water\"></v-icon>\n        <span class=\"al-stat-label\"><v-icon size=\"14\" icon=\"mdi-arrow-down\"></v-icon> Too low</span>\n        <span class=\"al-stat-num\">{{ lowCount }}</span>\n      </div>\n    </div>\n\n    <!-- Alerts table -->\n    <v-data-table\n      class=\"al-table\"\n      :headers=\"headers\"\n      :items=\"list\"\n      :items-per-page=\"8\"\n      items-per-page-text=\"Rows per page\"\n      density=\"comfortable\"\n      hover\n    >\n      <template v-slot:item.time=\"{ item }\">\n        <div class=\"al-time\">\n          <span class=\"al-bar\" :class=\"[sev(item), { 'al-latest': isLatest(item) }]\"></span>\n          <div>\n            <div class=\"al-date\">{{ splitTime(item.time)[0] }}</div>\n            <div class=\"al-hour\">{{ splitTime(item.time)[1] }}</div>\n          </div>\n        </div>\n      </template>\n\n      <template v-slot:item.sensor=\"{ item }\">\n        <div class=\"al-sensor\">\n          <span class=\"al-icon\"><v-icon size=\"18\" :icon=\"sensorIcon(item.sensor)\"></v-icon></span>\n          <span>{{ item.sensor }}</span>\n        </div>\n      </template>\n\n      <template v-slot:item.value=\"{ item }\">\n        <span class=\"al-value\" :class=\"sev(item)\">\n          {{ item.value }}<small>{{ item.unit }}</small>\n        </span>\n      </template>\n\n      <template v-slot:item.limit=\"{ item }\">\n        <span class=\"al-limit\">\n          {{ item.type === 'HIGH' ? 'max' : 'min' }}\n          <b>{{ item.limit }}{{ item.unit }}</b>\n        </span>\n      </template>\n\n      <template v-slot:item.message=\"{ item }\">\n        <span class=\"al-pill\" :class=\"sev(item)\">\n          <v-icon size=\"14\" :icon=\"item.type === 'HIGH' ? 'mdi-arrow-up' : 'mdi-arrow-down'\"></v-icon>\n          {{ item.message || (item.type === 'HIGH' ? 'Too high' : 'Too low') }}\n        </span>\n      </template>\n\n      <template v-slot:no-data>\n        <div class=\"al-empty\">\n          <v-icon class=\"al-empty-icon\" size=\"36\" icon=\"mdi-sprout\"></v-icon>\n          <div>No alerts. Your crops are happy.</div>\n        </div>\n      </template>\n    </v-data-table>\n\n  </div>\n</template>\n\n<script>\nexport default {\n  data() {\n    return {\n      headers: [\n        { title: 'Time',   key: 'time',    align: 'start' },\n        { title: 'Sensor', key: 'sensor',  align: 'start' },\n        { title: 'Value',  key: 'value',   align: 'center' },\n        { title: 'Limit',  key: 'limit',   align: 'center' },\n        { title: 'Alert',  key: 'message', align: 'start' }\n      ]\n    }\n  },\n  computed: {\n    list()      { return (this.msg && this.msg.payload) || [] },\n    total()     { return this.list.length },\n    highCount() { return this.list.filter(a => a.type === 'HIGH').length },\n    lowCount()  { return this.list.filter(a => a.type === 'LOW').length },\n    latest()    { return this.list.length ? this.list[0] : null }   // payload is newest first\n  },\n  methods: {\n    sev(item) {\n      return item.type === 'HIGH' ? 'al-high' : 'al-low'\n    },\n    isLatest(item) {\n      const f = this.latest\n      return !!f && item.time === f.time && item.sensor === f.sensor\n    },\n    splitTime(t) {\n      const p = String(t || '').split(/,?\\s+/)\n      return [p[0] || '', p[1] || '']\n    },\n    sensorIcon(name) {\n      const n = (name || '').toLowerCase()\n      if (n.includes('soil'))                      return 'mdi-sprout'\n      if (n.includes('hum') || n.includes('air'))  return 'mdi-water-percent'\n      if (n.includes('temp'))                      return 'mdi-thermometer'\n      return 'mdi-leaf'\n    }\n  }\n}\n</script>\n\n<style>\n/* Agriculture palette: change these 3 lines to recolor everything.\n   All class names are prefixed \"al-\" so nothing leaks to other widgets. */\n.al-root {\n  --al-leaf:  124, 179, 66;    /* leaf green  #7CB342  (accents, total)  */\n  --al-sun:   245, 166, 35;    /* sun amber   #F5A623  (too high)        */\n  --al-water:  38, 166, 154;   /* water teal  #26A69A  (too low)         */\n  color: rgb(var(--v-theme-on-surface));\n}\n.al-leaf { --al-c: var(--al-leaf); }\n.al-high { --al-c: var(--al-sun); }\n.al-low  { --al-c: var(--al-water); }\n\n/* ---------- Live strip ---------- */\n.al-live {\n  display: flex;\n  align-items: center;\n  gap: 8px;\n  margin-bottom: 14px;\n  font-size: 12px;\n  letter-spacing: .06em;\n  text-transform: uppercase;\n  opacity: var(--v-medium-emphasis-opacity);\n}\n.al-live-dot {\n  width: 8px;\n  height: 8px;\n  border-radius: 50%;\n  background: rgb(var(--al-leaf));\n  animation: al-dot 2s ease-in-out infinite;\n}\n.al-live-last { margin-left: auto; text-transform: none; letter-spacing: 0; }\n\n/* ---------- Summary tiles ---------- */\n.al-stats {\n  display: flex;\n  gap: 12px;\n  flex-wrap: wrap;\n  margin-bottom: 16px;\n}\n.al-stat {\n  position: relative;\n  overflow: hidden;\n  flex: 1;\n  min-width: 120px;\n  display: flex;\n  flex-direction: column;\n  padding: 12px 16px;\n  border-radius: 10px;\n  background: linear-gradient(135deg, rgba(var(--al-c), .16), rgba(var(--v-theme-on-surface), .04));\n  border: 1px solid rgba(var(--v-border-color), var(--v-border-opacity));\n  border-left: 4px solid rgb(var(--al-c));\n  transition: transform .2s ease, box-shadow .2s ease;\n  animation: al-rise .45s ease both;\n}\n.al-stat:nth-child(2) { animation-delay: .08s; }\n.al-stat:nth-child(3) { animation-delay: .16s; }\n.al-stat:hover {\n  transform: translateY(-3px);\n  box-shadow: 0 6px 16px rgba(var(--al-c), .22);\n}\n.al-stat-bg {\n  position: absolute !important;\n  right: 6px;\n  bottom: -6px;\n  opacity: .12;\n  color: rgb(var(--al-c)) !important;\n}\n.al-stat-label {\n  display: flex;\n  align-items: center;\n  gap: 4px;\n  font-size: 11px;\n  text-transform: uppercase;\n  letter-spacing: .08em;\n  opacity: var(--v-medium-emphasis-opacity);\n}\n.al-stat-num {\n  font-size: 28px;\n  font-weight: 700;\n  line-height: 1.25;\n  font-variant-numeric: tabular-nums;\n}\n\n/* ---------- Table ---------- */\n.al-root .al-table.v-data-table {\n  background: transparent;\n  color: inherit;\n}\n.al-root .al-table thead th {\n  font-size: 11px !important;\n  font-weight: 600 !important;\n  text-transform: uppercase;\n  letter-spacing: .08em;\n  border-bottom: 2px solid rgba(var(--al-leaf), .45) !important;\n}\n.al-root .al-table tbody tr {\n  animation: al-fade .4s ease both;\n}\n.al-root .al-table tbody tr:nth-child(2) { animation-delay: .04s; }\n.al-root .al-table tbody tr:nth-child(3) { animation-delay: .08s; }\n.al-root .al-table tbody tr:nth-child(4) { animation-delay: .12s; }\n.al-root .al-table tbody tr:nth-child(5) { animation-delay: .16s; }\n.al-root .al-table tbody tr:nth-child(6) { animation-delay: .20s; }\n.al-root .al-table tbody tr:nth-child(7) { animation-delay: .24s; }\n.al-root .al-table tbody tr:nth-child(8) { animation-delay: .28s; }\n.al-root .al-table tbody tr:hover td {\n  background: rgba(var(--al-leaf), .08) !important;\n}\n\n.al-time  { display: flex; align-items: center; gap: 12px; }\n.al-bar   { width: 4px; height: 32px; border-radius: 2px; background: rgb(var(--al-c)); }\n.al-bar.al-latest { animation: al-pulse 1.8s ease-out infinite; }\n.al-date  { font-size: 13px; font-weight: 600; }\n.al-hour  { font-size: 12px; opacity: var(--v-medium-emphasis-opacity); }\n\n.al-sensor { display: flex; align-items: center; gap: 10px; font-weight: 500; }\n.al-icon {\n  width: 32px;\n  height: 32px;\n  display: inline-flex;\n  align-items: center;\n  justify-content: center;\n  border-radius: 50%;\n  color: rgb(var(--al-leaf));\n  background: rgba(var(--al-leaf), .15);\n}\n\n.al-value        { font-size: 16px; font-weight: 700; color: rgb(var(--al-c)); }\n.al-value small  { font-size: 12px; font-weight: 400; margin-left: 2px; opacity: .8; }\n\n.al-limit        { font-size: 13px; opacity: var(--v-medium-emphasis-opacity); }\n.al-limit b      { font-weight: 600; color: rgb(var(--v-theme-on-surface)); }\n\n.al-pill {\n  display: inline-flex;\n  align-items: center;\n  gap: 4px;\n  padding: 3px 10px;\n  border-radius: 999px;\n  font-size: 12px;\n  font-weight: 600;\n  color: rgb(var(--al-c));\n  background: rgba(var(--al-c), .14);\n  border: 1px solid rgba(var(--al-c), .4);\n}\n\n.al-empty {\n  padding: 28px;\n  display: flex;\n  flex-direction: column;\n  align-items: center;\n  gap: 8px;\n  opacity: var(--v-medium-emphasis-opacity);\n}\n.al-empty-icon {\n  color: rgb(var(--al-leaf)) !important;\n  animation: al-float 3s ease-in-out infinite;\n}\n\n/* ---------- Animations ---------- */\n@keyframes al-rise  { from { opacity: 0; transform: translateY(8px); } to { opacity: 1; transform: none; } }\n@keyframes al-fade  { from { opacity: 0; transform: translateX(-6px); } to { opacity: 1; transform: none; } }\n@keyframes al-dot   { 0%, 100% { opacity: 1; transform: scale(1); } 50% { opacity: .35; transform: scale(.7); } }\n@keyframes al-pulse { 0% { box-shadow: 0 0 0 0 rgba(var(--al-c), .6); } 100% { box-shadow: 0 0 0 8px rgba(var(--al-c), 0); } }\n@keyframes al-float { 0%, 100% { transform: translateY(0); } 50% { transform: translateY(-5px); } }\n\n@media (prefers-reduced-motion: reduce) {\n  .al-root *, .al-root *::before, .al-root *::after { animation: none !important; transition: none !important; }\n}\n</style>",
+        "storeOutMessages": true,
+        "passthru": true,
+        "resendOnRefresh": true,
+        "templateScope": "local",
+        "className": "",
+        "x": 980,
+        "y": 260,
+        "wires": [
+            []
+        ]
+    },
+    {
+        "id": "316b9087067c7552",
+        "type": "ui-group",
+        "name": "Alert log",
+        "page": "da2c844b359a7f20",
+        "width": "12",
+        "height": 1,
+        "order": 1,
+        "showTitle": false,
+        "className": "",
+        "visible": "false",
+        "disabled": "false",
+        "groupType": "default"
+    },
+    {
+        "id": "da2c844b359a7f20",
+        "type": "ui-page",
+        "name": "Alerts",
+        "ui": "6d559b98ac204d2f",
+        "path": "/Alerts",
+        "icon": "alert",
+        "layout": "grid",
+        "theme": "7d0fb01838b8f5f5",
+        "breakpoints": [
+            {
+                "name": "Default",
+                "px": "0",
+                "cols": "3"
+            },
+            {
+                "name": "Tablet",
+                "px": "576",
+                "cols": "6"
+            },
+            {
+                "name": "Small Desktop",
+                "px": "768",
+                "cols": "9"
+            },
+            {
+                "name": "Desktop",
+                "px": "1024",
+                "cols": "12"
+            }
+        ],
+        "order": 3,
+        "className": "",
+        "visible": "true",
+        "disabled": "false"
+    },
+    {
+        "id": "6d559b98ac204d2f",
+        "type": "ui-base",
+        "name": "My Dashboard",
+        "path": "/dashboard",
+        "appIcon": "",
+        "includeClientData": true,
+        "acceptsClientConfig": [
+            "ui-notification",
+            "ui-control"
+        ],
+        "showPathInSidebar": false,
+        "headerContent": "page",
+        "navigationStyle": "default",
+        "titleBarStyle": "default",
+        "showReconnectNotification": true,
+        "notificationDisplayTime": 1,
+        "showDisconnectNotification": true,
+        "allowInstall": false
+    },
+    {
+        "id": "7d0fb01838b8f5f5",
+        "type": "ui-theme",
+        "name": "Theme 2",
+        "colors": {
+            "surface": "#18191b",
+            "primary": "#0d74ce",
+            "bgPage": "#111113",
+            "groupBg": "#212225",
+            "groupOutline": "#363a3f"
+        },
+        "sizes": {
+            "density": "default",
+            "pagePadding": "12px",
+            "groupGap": "12px",
+            "groupBorderRadius": "8px",
+            "widgetGap": "20px"
+        }
+    },
+    {
+        "id": "f49bcb64e79d7bc6",
+        "type": "global-config",
+        "env": [],
+        "modules": {
+            "@flowfuse/node-red-dashboard": "1.31.0"
+        }
+    }
+]
